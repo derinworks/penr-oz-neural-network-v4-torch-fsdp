@@ -48,7 +48,7 @@ class CausalSelfAttention(nn.Module):
                 torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim
             ))
         t = torch.arange(offset, offset + seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq.to(device))
+        freqs = torch.outer(t, inv_freq.to(device=device, dtype=torch.float32))
         emb = torch.cat([freqs, freqs], dim=-1)
         cos = emb.cos().unsqueeze(0).unsqueeze(0).to(dtype)
         sin = emb.sin().unsqueeze(0).unsqueeze(0).to(dtype)

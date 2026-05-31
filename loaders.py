@@ -11,7 +11,8 @@ from gpt_tokenizers import Tokenizer
 log = logging.getLogger(__name__)
 DATA_FOLDER = "data"
 os.makedirs(DATA_FOLDER, exist_ok=True)
-num_procs = max(1, os.cpu_count() // 2)
+_cpu_count = os.cpu_count()
+num_procs = max(1, (_cpu_count // 2) if _cpu_count is not None else 1)
 
 class Downloader:
     def __init__(self, dataset_id: str, shard_size: int, encoding: str):
@@ -35,7 +36,7 @@ class Downloader:
                     self._save(shard_idx, tokens[:self.shard_size])
                     shard_idx += 1
                     tokens = tokens[self.shard_size:]
-                if i % (self.shard_size // 100) == 0:
+                if i % max(1, self.shard_size // 100) == 0:
                     log.info(f"Cached {len(tokens)} of {self.shard_size} tokens in shard {shard_idx:06d}")
             if len(tokens) > 0:
                 self._save(shard_idx, tokens)
