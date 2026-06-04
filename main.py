@@ -19,9 +19,9 @@ from gpt_tokenizers import Tokenizer
 from loaders import Downloader, Loader
 
 app = FastAPI(
-    title="Neural Network Model API v3",
+    title="Neural Network Model API v4",
     description="API to create, serialize, output, evaluate, generate, train and diagnose of neural network models.",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 # Mount static and templates
