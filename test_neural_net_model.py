@@ -1310,5 +1310,63 @@ class TestNeuralNetModel(unittest.TestCase):
             self.assertIsNot(model.optimizer, original_optimizer)
 
 
+class TestFSDPStateHelpers(unittest.TestCase):
+    """FSDP2 DTensor-safety helpers for diagnostics and checkpointing."""
+
+    def test_to_plain_tensor_passthrough_and_none(self):
+        import neural_net_model as M
+        t = torch.tensor([1.0, 2.0])
+        self.assertIs(M._to_plain_tensor(t), t)
+        self.assertIsNone(M._to_plain_tensor(None))
+
+    def test_to_plain_tensor_uses_to_local(self):
+        import neural_net_model as M
+        local = torch.tensor([1.0, 2.0])
+        fake = MagicMock()
+        fake.to_local.return_value = local
+        self.assertIs(M._to_plain_tensor(fake), local)
+        fake.to_local.assert_called_once()
+
+    def test_weight_upd_ratio_none_inputs(self):
+        import neural_net_model as M
+        self.assertIsNone(M._weight_upd_ratio(None, torch.zeros(2, 2)))
+        self.assertIsNone(M._weight_upd_ratio(torch.zeros(2, 2), None))
+
+    def test_weight_upd_ratio_value(self):
+        import neural_net_model as M
+        pw = torch.zeros(2, 2)
+        w = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        self.assertIsInstance(M._weight_upd_ratio(pw, w), float)
+
+    def test_full_tensor_passthrough(self):
+        import neural_net_model as M
+        t = torch.tensor([1.0])
+        self.assertIs(M._full_tensor(t), t)
+
+    def test_full_tensor_gathers_dtensor(self):
+        import neural_net_model as M
+        full = torch.tensor([1.0, 2.0, 3.0])
+
+        class FakeDTensor:
+            def full_tensor(self):
+                gathered = MagicMock()
+                gathered.cpu.return_value = full
+                return gathered
+
+        with patch.object(M, "_DTensor", FakeDTensor):
+            self.assertIs(M._full_tensor(FakeDTensor()), full)
+
+    def test_is_sharded_false_and_full_state_dicts_plain(self):
+        layers = [{"embedding": {"num_embeddings": 8, "embedding_dim": 2}},
+                  {"linear": {"in_features": 2, "out_features": 8}},
+                  {"softmaxlast": {"dim": -1}}]
+        model = NeuralNetworkModel("test-fsd", Mapper(layers, {"sgd": {"lr": .01}}))
+        self.assertFalse(model._is_sharded())
+        model_state, optim_state = model.full_state_dicts()
+        self.assertIn("layers.0.weight", model_state)
+        self.assertIn("state", optim_state)
+        self.assertIn("param_groups", optim_state)
+
+
 if __name__ == '__main__':
     unittest.main()

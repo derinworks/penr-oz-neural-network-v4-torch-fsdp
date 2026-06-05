@@ -25,6 +25,40 @@ from transformers import AutoConfig, AutoModelForCausalLM
 log = logging.getLogger(__name__)
 MODELS_FOLDER = "models"
 
+try:  # DTensor is the FSDP2 sharded-parameter type (torch >= 2.6)
+    from torch.distributed.tensor import DTensor as _DTensor
+except Exception:  # pragma: no cover
+    _DTensor = None
+
+def _to_plain_tensor(t):
+    """Materialize a regular tensor from a possibly-FSDP-sharded ``DTensor``.
+
+    Under FSDP2, parameters and their gradients are ``DTensor``s; several
+    reduction ops used only for diagnostics (e.g. ``std``, ``histogram``) have
+    no DTensor sharding strategy, so operate on the local shard instead.
+    """
+    if t is None:
+        return None
+    to_local = getattr(t, "to_local", None)
+    return to_local() if callable(to_local) else t
+
+def _weight_upd_ratio(prev_weight, weight):
+    """Ratio of a weight's update std to its magnitude std (FSDP DTensor safe)."""
+    if weight is None or prev_weight is None:
+        return None
+    w = _to_plain_tensor(weight).data
+    pw = _to_plain_tensor(prev_weight).data
+    return ((w - pw).std() / (w.std() + 1e-8)).item()
+
+def _full_tensor(v):
+    """All-gather a sharded DTensor into a full CPU tensor (collective).
+
+    Must be called by every rank; non-DTensor values pass through unchanged.
+    """
+    if _DTensor is not None and isinstance(v, _DTensor):
+        return v.full_tensor().cpu()
+    return v
+
 class NeuralNetworkModel(nn.Module):
 
     @staticmethod
@@ -95,15 +129,19 @@ class NeuralNetworkModel(nn.Module):
     def get_model_path(cls, model_id):
         return os.path.join(MODELS_FOLDER, f"model_{model_id}.pth")
 
-    def serialize(self):
+    def serialize(self, model_state=None, optim_state=None):
+        if model_state is None:
+            model_state = self.state_dict()
+        if optim_state is None:
+            optim_state = self.optimizer.state_dict()
         os.makedirs(MODELS_FOLDER, exist_ok=True)
         os.makedirs(os.path.join(self.SHM_PATH, MODELS_FOLDER), exist_ok=True)
         model_path = self.get_model_path(self.model_id)
         model_data = {
             "layers": self.mapper.layers,
-            "state": self.state_dict(),
+            "state": model_state,
             "optim": self.mapper.optimizer,
-            "optim_state": self.optimizer.state_dict(),
+            "optim_state": optim_state,
             "progress": self.progress,
             "average_cost": self.avg_cost,
             "average_cost_history": self.avg_cost_history,
@@ -120,6 +158,31 @@ class NeuralNetworkModel(nn.Module):
         if fsdp.master_proc():
             log.info(f"Offload flushing model cache {model_in_shm_path} to {model_path}...")
         p.start()
+
+    def _is_sharded(self) -> bool:
+        """True when parameters are FSDP2-sharded DTensors."""
+        return _DTensor is not None and any(isinstance(p, _DTensor) for p in self.parameters())
+
+    def full_state_dicts(self):
+        """Full, unsharded (model_state, optimizer_state) as plain CPU tensors.
+
+        Under FSDP2 the sharded DTensor params and optimizer state are
+        all-gathered, so this MUST be called by every rank. Without sharding it
+        returns the plain local state dicts. Keeping the plain (index-keyed)
+        structure lets the non-distributed ``deserialize`` load it unchanged.
+        """
+        if not self._is_sharded():
+            return self.state_dict(), self.optimizer.state_dict()
+        model_state = {k: _full_tensor(v) for k, v in self.state_dict().items()}
+        optim_sd = self.optimizer.state_dict()
+        optim_state = {
+            "state": {
+                pid: {k: _full_tensor(v) for k, v in st.items()}
+                for pid, st in optim_sd.get("state", {}).items()
+            },
+            "param_groups": optim_sd.get("param_groups", []),
+        }
+        return model_state, optim_state
 
     @classmethod
     def deserialize(cls, model_id: str):
@@ -604,7 +667,7 @@ class NeuralNetworkModel(nn.Module):
         last_serialized = None
         if fsdp.master_proc():
             self.serialize()
-            last_serialized = time.time()
+        last_serialized = time.time()
         activations: list[Tensor] = []
         if fsdp.use_fsdp(device.type):
             model = fsdp.shard_model(self, device)
@@ -700,7 +763,7 @@ class NeuralNetworkModel(nn.Module):
                             "speedPerSec": epoch_speed,
                             "cost": progress_cost,
                             "weight_upd_ratio": [
-                                None if w is None or pw is None else ((w - pw).data.std() / (w.data.std() + 1e-8)).item()
+                                _weight_upd_ratio(pw, w)
                                 for pw, w in zip(prev_weights, self._weights)
                             ],
                         })
@@ -709,11 +772,15 @@ class NeuralNetworkModel(nn.Module):
                          f"Duration: {epoch_secs:.2f} secs, Speed: {epoch_speed:.2f} tokens/sec")
 
             # Serialize model while long training intervals
-            if fsdp.master_proc() and long_training: # pragma: no cover
-                self._record_training_overall_progress(activations)
-                self.serialize()
+            if long_training: # pragma: no cover
+                model_state, optim_state = self.full_state_dicts()
+                if fsdp.master_proc():
+                    self._record_training_overall_progress(activations)
+                    self.serialize(model_state, optim_state)
                 last_serialized = time.time()
 
+        # All-gather the full (unsharded) state across ranks before persisting (FSDP2-safe).
+        model_state, optim_state = self.full_state_dicts()
         if fsdp.master_proc():
             # Mark training finished
             self.status = {
@@ -725,7 +792,7 @@ class NeuralNetworkModel(nn.Module):
             log.info(f"Model {self.model_id}: Done training for {epochs} epochs.")
             # Serialize model after training
             self._record_training_overall_progress(activations)
-            self.serialize()
+            self.serialize(model_state, optim_state)
 
     @torch.no_grad()
     def _record_training_overall_progress(self, activations):
@@ -743,8 +810,11 @@ class NeuralNetworkModel(nn.Module):
         act_hist = [hist_f(torch.histogram(a.cpu(), density=True)) for a in activations]
         act_grad_hist = [([], []) if a.grad is None else hist_f(torch.histogram(a.grad.cpu(), density=True))
                          for a in activations]
-        weight_grad_hist = [([], []) if w is None else hist_f(torch.histogram(w.grad.cpu(), density=True))
-                            for w in self._weights]
+        # FSDP2 shards weights/grads as DTensors; use local shards for diagnostics.
+        plain_weights = [_to_plain_tensor(w) for w in self._weights]
+        plain_weight_grads = [None if w is None else _to_plain_tensor(w.grad) for w in self._weights]
+        weight_grad_hist = [([], []) if g is None else hist_f(torch.histogram(g.cpu(), density=True))
+                            for g in plain_weight_grads]
         algos = [l.__class__.__name__.lower() for l in self.layers]
         self.stats = {
             "layers": [{
@@ -768,18 +838,20 @@ class NeuralNetworkModel(nn.Module):
                     "histogram": {"x": ghx, "y": ghy},
                 } if a.grad is not None else None,
             } for algo, a, (ahx, ahy), (ghx, ghy) in zip(algos, activations, act_hist, act_grad_hist)],
-            "weights": [{
-                "shape": str(tuple(w.shape)),
-                "data": {
-                    "mean": w.mean().item(),
-                    "std": w.std().item(),
-                },
-                "gradient": {
-                    "mean": w.grad.mean().item(),
-                    "std": w.grad.std().item(),
-                    "histogram": {"x": ghx, "y": ghy},
-                },
-            } if w is not None else None for w, (ghx, ghy) in zip(self._weights, weight_grad_hist)],
+            "weights": [
+                None if w is None else {
+                    "shape": str(tuple(w.shape)),
+                    "data": {
+                        "mean": pw.mean().item(),
+                        "std": pw.std().item(),
+                    },
+                    "gradient": None if g is None else {
+                        "mean": g.mean().item(),
+                        "std": g.std().item(),
+                        "histogram": {"x": ghx, "y": ghy},
+                    },
+                }
+                for w, pw, g, (ghx, ghy) in zip(self._weights, plain_weights, plain_weight_grads, weight_grad_hist)],
         }
         # Log training progress
         log.info(f"Model {self.model_id} - Cost: {avg_progress_cost:.4f} Overall Cost: {self.avg_cost:.4f}")
